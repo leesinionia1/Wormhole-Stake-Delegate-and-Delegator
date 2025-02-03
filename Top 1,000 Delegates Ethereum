@@ -1,0 +1,308 @@
+WITH
+  address_names AS (
+    SELECT
+      *
+    FROM
+      query_3811994
+  ),
+  user_delegations AS (
+    SELECT
+      delegator,
+      current_delegate
+    FROM
+      (
+        SELECT
+          e.delegator,
+          e.fromDelegate AS old_delegate,
+          e.toDelegate AS current_delegate,
+          evt_block_number AS number,
+          evt_index,
+          e.evt_block_time AS time,
+          e.evt_tx_hash AS hash,
+          DENSE_RANK() OVER (
+            PARTITION BY
+              delegator
+            ORDER BY
+              e.evt_block_number DESC,
+              evt_index DESC
+          ) AS evt_rank
+        FROM
+          wormhole_ethereum.WToken_evt_DelegateChanged e
+      ) e
+    WHERE
+      evt_rank = 1 --grab the most recent update
+  ),
+  current_delegate_voting_power AS (
+    SELECT
+      *
+    FROM
+      (
+        SELECT
+          c.delegate,
+          c.evt_block_number AS number,
+          evt_index,
+          c.evt_block_time AS time,
+          c.evt_tx_hash AS hash,
+          cast(c.newVotes as double) / POWER(10, 18) AS dt_voting_power,
+          (
+            cast(c.newVotes as double) / POWER(10, 18) - cast(c.previousVotes as double) / POWER(10, 18)
+          ) AS amt_delegated,
+          DENSE_RANK() OVER (
+            PARTITION BY
+              delegate
+            ORDER BY
+              c.evt_block_number DESC,
+              evt_index DESC
+          ) AS evt_rank
+        FROM
+          wormhole_ethereum.WToken_evt_DelegateVotesChanged c
+      ) dv
+    WHERE
+      evt_rank = 1 --grab the most recent update
+      -- GROUP BY 1
+  ),
+  previous_delegate_voting_power AS (
+    SELECT
+      *
+    FROM
+      (
+        SELECT
+          c.delegate,
+          c.evt_block_number AS number,
+          evt_index,
+          c.evt_block_time AS time,
+          c.evt_tx_hash AS hash,
+          cast(c.newVotes as double) / POWER(10, 18) AS dt_voting_power,
+          (
+            cast(c.newVotes as double) / POWER(10, 18) - cast(c.previousVotes as double) / POWER(10, 18)
+          ) AS amt_delegated,
+          DENSE_RANK() OVER (
+            PARTITION BY
+              delegate
+            ORDER BY
+              c.evt_block_number DESC,
+              evt_index DESC
+          ) AS evt_rank
+        FROM
+          wormhole_ethereum.WToken_evt_DelegateVotesChanged c
+        WHERE
+          evt_block_time < NOW() - interval '1' day
+      ) dv
+    WHERE
+      evt_rank = 1 --grab the most recent update
+      -- GROUP BY 1
+  ),
+  delegate_labels AS (
+    SELECT
+      address,
+      COALESCE(
+        case
+          when name = '' then null
+          else name
+        end,
+        case
+          when labels = '' then null
+          else labels
+        end
+      ) AS name,
+      case
+        when ens = '' then null
+        else ens
+      end AS ens
+    FROM
+      (
+        SELECT
+          vp.delegate AS address,
+          concat_ws(',', ARRAY_AGG(DISTINCT names.name)) AS name,
+          concat_ws(
+            ',',
+            ARRAY_AGG(DISTINCT COALESCE(ens.name, names.ens))
+          ) AS ens,
+          concat_ws(',', ARRAY_AGG(DISTINCT inst.name)) AS labels
+        FROM
+          current_delegate_voting_power vp
+          LEFT JOIN address_names names ON names.address = vp.delegate
+          LEFT JOIN labels.ens ens ON ens.address = vp.delegate
+          AND names.address IS NULL -- no match to names
+          AND ens.name IS NOT NULL
+          LEFT JOIN labels.all inst ON inst.address = vp.delegate
+          AND inst.category = 'institution'
+          AND names.address IS NULL -- no match to names
+          AND inst.name IS NOT NULL
+        WHERE
+          dt_voting_power > 0
+          and delegate != 0x0000000000000000000000000000000000000000
+        GROUP BY
+          1
+      ) a
+  ),
+  mapped_delegates AS (
+    SELECT
+      delegate,
+      CASE
+        WHEN delegate = 'Other' THEN 1001
+        ELSE DENSE_RANK() OVER (
+          ORDER BY
+            CASE
+              WHEN delegate = 'Other' THEN 0
+              ELSE dt_voting_power
+            END DESC
+        )
+      END AS delegate_rank,
+      CASE
+        WHEN delegate = 'Other' THEN delegate
+        ELSE '<a href="https://www.tally.xyz/gov/wormhole/delegate/select?step=2&address=' || delegate || '" target ="_blank">' || CASE
+          WHEN name IS NOT NULL
+          OR ens IS NOT NULL THEN COALESCE(
+            case
+              when name is null then null
+              else name || ' - '
+            end,
+            ''
+          ) || COALESCE(
+            case
+              when ens is null then null
+              else ens || ' - '
+            end,
+            ''
+          ) || substring(delegate, 1, 4) || '...' || substring(delegate, -4, 4)
+          ELSE delegate
+        END || '</a>'
+      END AS delegate_name,
+      get_href (
+        'https://dune.com/bennyback/delegator-breakdown-by-delegate?Delegate=' || cast(delegate as varchar),
+        '🔗 ✨'
+      ) AS delegator_link,
+      '|' AS col1,
+      dt_voting_power,
+      pct_voting_power,
+      '|' AS col2,
+      vp_change_30d,
+      cast(vp_change_30d as double) / NULLIF(cast(prev_voting_power as double), 0) AS pct_vp_change_30d,
+      '|' AS col3,
+      --TODO: Update to only show delegators with > 0 W balance
+      num_delegators,
+      cast(num_delegators as double) / cast(SUM(num_delegators) OVER () as double) AS pct_delegators,
+      COALESCE(name, ens, delegate) AS delegate_name_raw,
+      delegate as delegate_address
+      --TODO: Re-do "Avg W per Delegator" to not count addresses with 0 W balance
+      --   '|',
+      --   dt_voting_power / num_delegators AS avg_w_per_delegator
+    FROM
+      (
+        SELECT
+          delegate,
+          name,
+          ens,
+          SUM(dt_voting_power) AS dt_voting_power,
+          SUM(pct_voting_power) AS pct_voting_power,
+          SUM(num_delegators) AS num_delegators,
+          SUM(vp_change_30d) AS vp_change_30d,
+          SUM(prev_voting_power) AS prev_voting_power,
+          SUM(pct_vp_change_30d) AS pct_vp_change_30d
+        FROM
+          (
+            SELECT
+              CASE
+                WHEN d_rank <= 1000
+                OR prev_d_rank <= 1000 THEN cast(delegate as varchar)
+                ELSE 'Other'
+              END AS delegate,
+              name,
+              ens,
+              dt_voting_power,
+              prev_voting_power,
+              pct_voting_power,
+              cast(dt_voting_power - prev_voting_power as double) AS vp_change_30d,
+              cast(dt_voting_power - prev_voting_power as double) / NULLIF(cast(prev_voting_power as double), 0) AS pct_vp_change_30d,
+              COUNT(*) AS num_delegators
+            FROM
+              (
+                SELECT
+                  vp.delegate,
+                  vp.dt_voting_power,
+                  vp.dt_voting_power / (SUM(vp.dt_voting_power) OVER ()) AS pct_voting_power,
+                  ROW_NUMBER() OVER (
+                    ORDER BY
+                      vp.dt_voting_power DESC,
+                      COALESCE(pvp.dt_voting_power, 0) DESC
+                  ) AS d_rank,
+                  ROW_NUMBER() OVER (
+                    ORDER BY
+                      COALESCE(pvp.dt_voting_power, 0) DESC,
+                      vp.dt_voting_power DESC
+                  ) AS prev_d_rank,
+                  COALESCE(pvp.dt_voting_power, 0) AS prev_voting_power
+                FROM
+                  current_delegate_voting_power vp
+                  LEFT JOIN previous_delegate_voting_power pvp ON pvp.delegate = vp.delegate
+                WHERE
+                  vp.delegate != 0x0000000000000000000000000000000000000000
+              ) rnk
+              LEFT JOIN user_delegations u ON u.current_delegate = rnk.delegate
+              LEFT JOIN delegate_labels dl ON dl.address = rnk.delegate
+              AND (
+                d_rank <= 1000
+                OR prev_d_rank <= 1000
+              )
+            GROUP BY
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8
+            HAVING
+              COUNT(*) > 0 -- an address that currently has delegates
+          ) s
+        GROUP BY
+          1,
+          2,
+          3
+      ) sh
+  )
+SELECT
+  *,
+  SUM(dt_voting_power) OVER () AS total_voting_power,
+  MIN(
+    CASE
+      WHEN running_pct_voting_power >= 0.5 THEN delegate_rank
+      ELSE 1e18
+    END
+  ) OVER () AS num_delegates_to_majority,
+  MIN(
+    CASE
+      WHEN running_dt_voting_power >= 21000000 THEN delegate_rank
+      ELSE 1e18
+    END
+  ) OVER () AS num_delegates_to_quorum
+FROM
+  (
+    SELECT
+      *,
+      SUM(pct_voting_power) OVER (
+        ORDER BY
+          delegate_rank ASC
+      ) AS running_pct_voting_power,
+      SUM(dt_voting_power) OVER (
+        ORDER BY
+          delegate_rank ASC
+      ) AS running_dt_voting_power
+    FROM
+      (
+        SELECT
+          *,
+          ROW_NUMBER() OVER (
+            PARTITION BY
+              delegate
+            ORDER BY
+              delegate_name DESC
+          ) AS rn
+        FROM
+          mapped_delegates
+      )
+    WHERE
+      rn = 1 --ensure no ens mapping duplicates
+  ) fins
